@@ -15,6 +15,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -23,7 +27,11 @@
 
 #include <algorithm>
 
+#ifndef USE_ROCM
 #define WARP_SIZE 32
+#else
+#define WARP_SIZE warpSize
+#endif
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
@@ -40,7 +48,7 @@ inline __device__ float block_sum(float* red_smem, float sum) {
   // Compute the sum per warp.
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-    sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+    sum += VLLM_SHFL_XOR_SYNC(sum, mask);
   }
 
   // Warp leaders store the data to shared memory.
@@ -59,11 +67,11 @@ inline __device__ float block_sum(float* red_smem, float sum) {
   // Parallel reduction inside the warp.
 #pragma unroll
   for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+    sum += VLLM_SHFL_XOR_SYNC(sum, mask);
   }
 
   // Broadcast to other threads.
-  return __shfl_sync(uint32_t(-1), sum, 0);
+  return VLLM_SHFL_SYNC(sum, 0);
 }
 
 // TODO(woosuk): Merge the last two dimensions of the grid.
@@ -175,7 +183,10 @@ __device__ void paged_attention_kernel(
   // dot product with the query.
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) {
-    const int physical_block_number = block_table[block_idx];
+    // NOTE(woosuk): The block number is stored in int32. However, we cast it to int64
+    // because int32 can lead to overflow when this variable is multiplied by large numbers
+    // (e.g., kv_block_stride).
+    const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
 
     // Load a key to registers.
     // Each thread in a thread group has a different part of the key.
@@ -220,7 +231,7 @@ __device__ void paged_attention_kernel(
   // The 0-th thread of each thread group already has its max qk value.
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
-    qk_max = fmaxf(qk_max, __shfl_xor_sync(uint32_t(-1), qk_max, mask));
+    qk_max = fmaxf(qk_max, VLLM_SHFL_XOR_SYNC(qk_max, mask));
   }
   if (lane == 0) {
     red_smem[warp_idx] = qk_max;
@@ -232,10 +243,10 @@ __device__ void paged_attention_kernel(
   qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
   for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    qk_max = fmaxf(qk_max, __shfl_xor_sync(uint32_t(-1), qk_max, mask));
+    qk_max = fmaxf(qk_max, VLLM_SHFL_XOR_SYNC(qk_max, mask));
   }
   // Broadcast the max qk value to all threads.
-  qk_max = __shfl_sync(uint32_t(-1), qk_max, 0);
+  qk_max = VLLM_SHFL_SYNC(qk_max, 0);
 
   // Get the sum of the exp values.
   float exp_sum = 0.f;
@@ -285,7 +296,10 @@ __device__ void paged_attention_kernel(
   scalar_t zero_value;
   zero(zero_value);
   for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) {
-    const int physical_block_number = block_table[block_idx];
+    // NOTE(woosuk): The block number is stored in int32. However, we cast it to int64
+    // because int32 can lead to overflow when this variable is multiplied by large numbers
+    // (e.g., kv_block_stride).
+    const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
     L_vec logits_vec;
@@ -320,7 +334,7 @@ __device__ void paged_attention_kernel(
     float acc = accs[i];
 #pragma unroll
     for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
-      acc += __shfl_xor_sync(uint32_t(-1), acc, mask);
+      acc += VLLM_SHFL_XOR_SYNC(acc, mask);
     }
     accs[i] = acc;
   }
@@ -486,7 +500,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   // Reduce within the warp.
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-    max_logit = fmaxf(max_logit, __shfl_xor_sync(uint32_t(-1), max_logit, mask));
+    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
   }
   if (lane == 0) {
     red_smem[warp_idx] = max_logit;
@@ -496,10 +510,10 @@ __global__ void paged_attention_v2_reduce_kernel(
   max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
   for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    max_logit = fmaxf(max_logit, __shfl_xor_sync(uint32_t(-1), max_logit, mask));
+    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
   }
   // Broadcast the max value to all threads.
-  max_logit = __shfl_sync(uint32_t(-1), max_logit, 0);
+  max_logit = VLLM_SHFL_SYNC(max_logit, 0);
 
   // Load rescaled exp sums to shared memory.
   float* shared_exp_sums = reinterpret_cast<float*>(shared_mem + sizeof(float) * num_partitions);
@@ -533,9 +547,9 @@ __global__ void paged_attention_v2_reduce_kernel(
 } // namespace vllm
 
 #define LAUNCH_PAGED_ATTENTION_V1(HEAD_SIZE)                                                  \
-  cudaFuncSetAttribute(                                                                       \
-    vllm::paged_attention_v1_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>,                   \
-    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size);                            \
+  VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(                                       \
+    ((void*)vllm::paged_attention_v1_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>),          \
+    shared_mem_size);                                                                         \
   vllm::paged_attention_v1_kernel<T, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>                      \
   <<<grid, block, shared_mem_size, stream>>>(                                                 \
     out_ptr,                                                                                  \
